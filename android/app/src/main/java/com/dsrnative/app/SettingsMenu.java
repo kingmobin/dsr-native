@@ -96,6 +96,7 @@ public final class SettingsMenu {
         Strings.setLanguage(v.containsKey("language") ? v.get("language") : "en-US");
         TouchControls.sRecenter = !"0".equals(v.get("touch_camera_recenter"));
         TouchControls.setLayout(v.get("touch_layout"));
+        TouchControls.setAppearance(v);
         if ("1".equals(v.get("fps_counter"))) FpsCounter.apply(activity, true);
         showFirstLaunchTip(activity);
     }
@@ -737,6 +738,17 @@ public final class SettingsMenu {
                         Strings.t("speed_faster")}, "1.0");
         toggle("touch_camera_invert", Strings.t("invert_t"), null, "1", "0", "0");
         toggle("touch_camera_recenter", Strings.t("drift_t"), Strings.t("drift_n"), "0", "1", "1");
+        choice("touch_deadzone", Strings.t("touch_dz_t"), null, new String[] {"0", "0.05", "0.08", "0.12", "0.2"},
+                new String[] {"0%", "5%", "8%", "12%", "20%"}, "0.08");
+        toggle("touch_stick_float", Strings.t("float_t"), Strings.t("float_n"), "1", "0", "0");
+
+        section(Strings.t("sec_appearance"));
+        final String[] scales = {"0.8", "1.0", "1.2", "1.4"}, scaleLabels = {"80%", "100%", "120%", "140%"};
+        choice("touch_size", Strings.t("touch_size_t"), null, scales, scaleLabels, "1.0");
+        choice("touch_stick_size", Strings.t("touch_stick_size_t"), null, scales, scaleLabels, "1.0");
+        choice("touch_spacing", Strings.t("touch_spacing_t"), null, scales, scaleLabels, "1.0");
+        toggle("touch_outline", Strings.t("outline_t"), null, "1", "0", "1");
+        toggle("touch_labels", Strings.t("labels_t"), null, "1", "0", "1");
 
         section(Strings.t("sec_layout"));
         note(Strings.t("layout_n"));
@@ -747,17 +759,9 @@ public final class SettingsMenu {
                 ViewGroup.LayoutParams.WRAP_CONTENT);
         lp.topMargin = dp(8);
         mBody.addView(edit, lp);
-        TextView reset = chip(Strings.t("reset_layout"), false);
+        TextView reset = chip(Strings.t("restore_default"), false);
         reset.setGravity(Gravity.CENTER);
-        reset.setOnClickListener(v -> {
-            if (!writeSetting("touch_layout", "")) {
-                cantSave();
-                return;
-            }
-            mValues.put("touch_layout", "");
-            TouchControls.setLayout("");
-            Toast.makeText(mA, Strings.t("layout_reset_done"), Toast.LENGTH_SHORT).show();
-        });
+        reset.setOnClickListener(v -> useLayout("", Strings.t("layout_reset_done")));
         LinearLayout.LayoutParams lp2 = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT);
         lp2.topMargin = dp(8);
@@ -765,29 +769,99 @@ public final class SettingsMenu {
 
         section(Strings.t("sec_presets"));
         note(Strings.t("presets_n"));
+        String current = currentLayout();
+        for (final Map.Entry<String, String> e : HudModel.builtinPresets().entrySet()) {  // the built-in ones
+            final String name = Strings.t("preset_" + e.getKey()), layout = e.getValue();
+            TextView row = chip(name, false);
+            row.setGravity(Gravity.CENTER);
+            row.setSelected(HudModel.same(layout, current));
+            row.setOnClickListener(v -> useLayout(layout, Strings.t("preset_loaded", name)));
+            LinearLayout.LayoutParams bl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT);
+            bl.topMargin = dp(6);
+            mBody.addView(row, bl);
+        }
         TextView savePreset = chip(Strings.t("preset_save"), false);
         savePreset.setGravity(Gravity.CENTER);
         savePreset.setOnClickListener(v -> savePresetDialog());
         LinearLayout.LayoutParams lp3 = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT);
-        lp3.topMargin = dp(8);
+        lp3.topMargin = dp(14);
         mBody.addView(savePreset, lp3);
         JSONObject presets = loadPresets(mA);
         List<String> names = new ArrayList<>();
         for (Iterator<String> it = presets.keys(); it.hasNext();) names.add(it.next());
         java.util.Collections.sort(names, String.CASE_INSENSITIVE_ORDER);
-        String current = mValues.containsKey("touch_layout") ? mValues.get("touch_layout") : "";
-        for (final String name : names) {
+        for (final String name : names) {  // the player's own
             final String layout = presets.optString(name, "");
             TextView row = chip(name, false);
             row.setGravity(Gravity.CENTER);
-            row.setSelected(same(layout, current) || (layout.isEmpty() && (current == null || current.isEmpty())));
+            row.setSelected(HudModel.same(layout, current));
             row.setOnClickListener(v -> presetDialog(name, layout));
             LinearLayout.LayoutParams rl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT);
             rl.topMargin = dp(6);
             mBody.addView(row, rl);
         }
+    }
+
+    private String currentLayout() {
+        String c = mValues.get("touch_layout");
+        return c == null ? "" : c;
+    }
+
+    /** True when `layout` is one the player could not get back: not the defaults and not saved as any preset. */
+    private boolean wouldBeLost(String layout) {
+        if (HudModel.parse(layout).isDefault()) return false;
+        for (String b : HudModel.builtinPresets().values())
+            if (HudModel.same(layout, b)) return false;
+        JSONObject presets = loadPresets(mA);
+        for (Iterator<String> it = presets.keys(); it.hasNext();)
+            if (HudModel.same(layout, presets.optString(it.next(), ""))) return false;
+        return true;
+    }
+
+    /**
+     * Switches to a layout (a preset, or "" for the default). A layout of the player's own that is not saved anywhere
+     * is never dropped without asking: they can keep a copy as a preset, replace it, or cancel.
+     */
+    private void useLayout(final String layout, final String done) {
+        final String current = currentLayout();
+        if (HudModel.same(layout, current)) return;
+        if (!wouldBeLost(current)) {
+            applyLayout(layout, done);
+            return;
+        }
+        AlertDialog d = new AlertDialog.Builder(mA, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle(Strings.t("replace_t"))
+                .setMessage(Strings.t("replace_m"))
+                .setPositiveButton(Strings.t("replace_copy"), (dlg, w) -> {
+                    JSONObject presets = loadPresets(mA);
+                    int n = presets.length() + 1;
+                    while (presets.has(Strings.t("preset_prev", n))) n++;
+                    try {
+                        presets.put(Strings.t("preset_prev", n), current);
+                    } catch (Exception e) {
+                        return;
+                    }
+                    storePresets(mA, presets);
+                    applyLayout(layout, done);
+                })
+                .setNeutralButton(Strings.t("replace_yes"), (dlg, w) -> applyLayout(layout, done))
+                .setNegativeButton(Strings.t("cancel"), null)
+                .create();
+        GameActivity.showImmersive(d);
+    }
+
+    private void applyLayout(String layout, String done) {
+        if (!writeSetting("touch_layout", layout)) {
+            cantSave();
+            return;
+        }
+        mValues.put("touch_layout", layout);
+        TouchControls.setLayout(layout);
+        Toast.makeText(mA, done, Toast.LENGTH_SHORT).show();
+        if (mTab == TAB_TOUCH) showTab(TAB_TOUCH);
     }
 
     // ---- touch layout presets (app preferences, "touch_presets": a JSON object of name -> touch_layout) -------------
@@ -841,16 +915,7 @@ public final class SettingsMenu {
     private void presetDialog(final String name, final String layout) {
         AlertDialog d = new AlertDialog.Builder(mA, android.R.style.Theme_DeviceDefault_Dialog_Alert)
                 .setTitle(name)
-                .setPositiveButton(Strings.t("preset_use"), (dlg, w) -> {
-                    if (!writeSetting("touch_layout", layout)) {
-                        cantSave();
-                        return;
-                    }
-                    mValues.put("touch_layout", layout);
-                    TouchControls.setLayout(layout);
-                    Toast.makeText(mA, Strings.t("preset_loaded", name), Toast.LENGTH_SHORT).show();
-                    if (mTab == TAB_TOUCH) showTab(TAB_TOUCH);
-                })
+                .setPositiveButton(Strings.t("preset_use"), (dlg, w) -> useLayout(layout, Strings.t("preset_loaded", name)))
                 .setNeutralButton(Strings.t("preset_delete"), (dlg, w) -> {
                     JSONObject presets = loadPresets(mA);
                     presets.remove(name);
@@ -1374,6 +1439,11 @@ public final class SettingsMenu {
             now = true;
         } else if (key.equals("touch_camera_recenter")) {
             TouchControls.sRecenter = !"0".equals(value);
+            now = true;
+        } else if (key.equals("touch_size") || key.equals("touch_stick_size") || key.equals("touch_spacing")
+                || key.equals("touch_deadzone") || key.equals("touch_stick_float") || key.equals("touch_outline")
+                || key.equals("touch_labels")) {
+            TouchControls.setAppearance(mValues);
             now = true;
         } else if (key.startsWith("touch_") && !key.equals("touch_camera_invert")) {
             boolean on = !"0".equals(mValues.get("touch_controls"));

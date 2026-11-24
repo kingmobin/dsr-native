@@ -524,6 +524,7 @@ public class GameActivity extends NativeActivity {
     @Override
     protected void onPause() {
         super.onPause();
+        TouchControls.releaseForMenu();  // nothing on the touch controls stays held while the app is away
         if (mAsked) mPausedSinceAsk = true;
     }
 
@@ -558,6 +559,7 @@ public class GameActivity extends NativeActivity {
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
         if (hasFocus) hideSystemBars();
+        else TouchControls.releaseForMenu();  // the shade, a dialog or another window took the focus
     }
 
     private void hideSystemBars() {

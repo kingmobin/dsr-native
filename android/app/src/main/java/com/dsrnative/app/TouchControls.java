@@ -3,108 +3,98 @@ package com.dsrnative.app;
 import android.app.Activity;
 import android.content.Context;
 import android.graphics.Canvas;
+import android.graphics.DashPathEffect;
 import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.PixelFormat;
 import android.graphics.RectF;
 import android.hardware.input.InputManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.view.InputDevice;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.WindowInsets;
 import android.view.WindowManager;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 
 /**
- * On-screen controls drawn in a transparent panel window over the game. A fixed stick at the bottom left
- * moves, a smaller stick appears wherever the right side of the screen is touched (not on a button) and turns
- * the camera, and the Switch buttons sit around the edges.
- * They hide when a game controller is connected or used, and come back with a double tap on the screen.
- * State goes to native code (nativeState), which merges it with the controller.
- * The player can move and resize the controls (editLayout, from the settings menu): each group (face buttons, d-pad,
- * stick, each shoulder button, ...) keeps an offset from its default spot in layout units (a tenth of the screen's
- * short side) and a size factor, saved in settings.txt as `touch_layout = group:dx,dy[,size];...` (size 1 = default,
- * left out; layouts from before sizes existed read as size 1).
+ * On-screen controls drawn in a transparent panel window over the game: a mobile-style HUD for the Switch controller
+ * the game expects. A stick at the bottom left moves; the right half of the screen (except the buttons) turns the
+ * camera with a stick that appears under the thumb; the face buttons sit in an arc under the right thumb; the shoulder
+ * buttons, d-pad and the rest are smaller and dimmer. What each button presses is fixed (HudModel.SPECS, the nn::hid
+ * bits); only how it looks and where it sits changes.
+ *
+ * They hide when a game controller is connected or used, and come back with a double tap on the screen (or when the
+ * last controller goes away). State goes to native code (nativeState), which merges it with the controller.
+ *
+ * Every element (HudModel.GROUPS) can be moved, resized, faded and hidden in the HUD editor (editLayout, from the
+ * settings menu). The layout is saved in settings.txt `touch_layout` (format: see HudModel). Appearance settings
+ * (button and stick size, spacing, dead zone, outlines, labels, floating stick) are `touch_*` keys too.
  */
 public final class TouchControls extends View implements InputManager.InputDeviceListener {
-    // nn::hid button bits (src/hle/input.h).
-    static final int A = 1, B = 1 << 1, X = 1 << 2, Y = 1 << 3, L3 = 1 << 4, R3 = 1 << 5, L = 1 << 6, R = 1 << 7,
-            ZL = 1 << 8, ZR = 1 << 9, PLUS = 1 << 10, MINUS = 1 << 11, LEFT = 1 << 12, UP = 1 << 13, RIGHT = 1 << 14,
-            DOWN = 1 << 15;
-
     static native void nativeState(int buttons, float lx, float ly, float rx, float ry);
     static native void nativeVisible(boolean visible);
 
     private static TouchControls sView;
     /** settings.txt touch_camera_recenter: a thumb resting on the camera stick brings it back to the centre. */
     static volatile boolean sRecenter = true;
-    /** Offsets of the groups from their default spots, in layout units (settings.txt touch_layout). */
-    private static volatile Map<String, float[]> sLayout = new HashMap<>();
-    /** Groups that can be moved, in settings.txt. */
-    static final String[] GROUPS = {"face", "dpad", "stick", "zl", "l", "zr", "r", "minus", "plus", "l3", "lock"};
+    /** What the player customised (settings.txt touch_layout). */
+    private static volatile HudModel.Layout sLayout = new HudModel.Layout();
 
-    /** Size factors a group can have (layout editor: pinch, or - / +). */
-    static final float SIZE_MIN = 0.5f, SIZE_MAX = 2.0f, SIZE_STEP = 0.1f;
-
-    /** settings.txt touch_layout -> {dx, dy, size} per group (unknown groups and bad numbers are skipped). */
-    static Map<String, float[]> parseLayout(String s) {
-        Map<String, float[]> m = new HashMap<>();
-        if (s == null) return m;
-        for (String part : s.split(";")) {
-            int c = part.indexOf(':');
-            if (c <= 0) continue;
-            String g = part.substring(0, c).trim().toLowerCase(Locale.ROOT);
-            boolean known = false;
-            for (String x : GROUPS) known |= x.equals(g);
-            if (!known) continue;
-            String[] n = part.substring(c + 1).split(",");
-            if (n.length < 2) continue;
-            try {
-                float dx = Float.parseFloat(n[0].trim());
-                float dy = Float.parseFloat(n[1].trim());
-                float size = n.length > 2 ? Float.parseFloat(n[2].trim()) : 1f;
-                if (Float.isFinite(dx) && Float.isFinite(dy) && Math.abs(dx) < 50 && Math.abs(dy) < 50
-                        && Float.isFinite(size))
-                    m.put(g, new float[] {dx, dy, Math.max(SIZE_MIN, Math.min(SIZE_MAX, size))});
-            } catch (NumberFormatException ignored) {
-            }
-        }
-        return m;
+    /** Appearance settings (settings.txt touch_outline, touch_labels, touch_deadzone, touch_stick_float, touch_size, ...). */
+    static final class Style {
+        boolean outline = true, labels = true, floating;
+        float deadzone = 0.08f, size = 1f, stickSize = 1f, spacing = 1f;
     }
 
-    static String formatLayout(Map<String, float[]> m) {
-        StringBuilder b = new StringBuilder();
-        for (String g : GROUPS) {
-            float[] o = m.get(g);
-            if (o == null) continue;
-            float size = o.length > 2 ? o[2] : 1f;
-            boolean moved = Math.abs(o[0]) >= 0.005f || Math.abs(o[1]) >= 0.005f, sized = Math.abs(size - 1f) >= 0.005f;
-            if (!moved && !sized) continue;
-            if (b.length() > 0) b.append(';');
-            b.append(String.format(Locale.ROOT, "%s:%.2f,%.2f", g, o[0], o[1]));
-            if (sized) b.append(String.format(Locale.ROOT, ",%.2f", size));
+    private static volatile Style sStyle = new Style();
+
+    private static float num(String s, float def, float min, float max) {
+        if (s == null) return def;
+        try {
+            float f = Float.parseFloat(s.trim());
+            return Float.isFinite(f) ? Math.max(min, Math.min(max, f)) : def;
+        } catch (NumberFormatException e) {
+            return def;
         }
-        return b.toString();
+    }
+
+    /** The appearance settings from settings.txt (missing ones keep their defaults): applied to the controls at once. */
+    static void setAppearance(Map<String, String> v) {
+        Style s = new Style();
+        s.outline = !"0".equals(v.get("touch_outline"));
+        s.labels = !"0".equals(v.get("touch_labels"));
+        s.floating = "1".equals(v.get("touch_stick_float"));
+        s.deadzone = num(v.get("touch_deadzone"), 0.08f, 0f, 0.4f);
+        s.size = num(v.get("touch_size"), 1f, 0.5f, 2f);
+        s.stickSize = num(v.get("touch_stick_size"), 1f, 0.5f, 2f);
+        s.spacing = num(v.get("touch_spacing"), 1f, 0.6f, 1.6f);
+        sStyle = s;
+        final TouchControls view = sView;
+        if (view != null) view.post(view::relayout);
     }
 
     /** The saved layout (settings.txt touch_layout): applied to the controls at once. */
     static void setLayout(String s) {
-        sLayout = parseLayout(s);
+        sLayout = HudModel.parse(s);
         final TouchControls v = sView;
         if (v != null) v.post(v::relayout);
     }
 
-    /** True while the player moves the controls. */
+    /** The layout as saved (for the settings menu: is the current layout one that would be lost?). */
+    static String currentLayoutString() {
+        return HudModel.format(sLayout);
+    }
+
+    /** True while the player edits the HUD. */
     static volatile boolean sEditing;
 
     /**
-     * Lets the player move the controls (shown for it even when they are off or hidden). Save writes the layout to
+     * Lets the player edit the HUD (shown for it even when the controls are off or hidden). Save writes the layout to
      * settings.txt; `done` runs on the UI thread when the editor closes (saved or not).
      */
     static void editLayout(final Activity activity, final Runnable done) {
@@ -159,6 +149,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
             }
             sView.setAlpha(Math.max(0.1f, Math.min(1.0f, opacity)));
             sView.mCameraSpeed = Math.max(0.1f, Math.min(10f, cameraSpeed));
+            sView.mT.cameraSpeed = sView.mCameraSpeed;
             sView.invalidate();
         });
     }
@@ -183,70 +174,46 @@ public final class TouchControls extends View implements InputManager.InputDevic
     private final Handler mHandler = new Handler(Looper.getMainLooper());
     private boolean mShown = true;
 
-    private static final int K_BUTTON = 0, K_STICK = 1, K_RSTICK = 2, K_NONE = 3;
+    private static final int N = HudModel.SPECS.length;
+    private static final float SECONDARY = 0.8f;  // dpad, minus, plus, L3, LOCK are drawn dimmer than the main controls
 
-    private static final class Button {
-        final String label;
-        final int bit;
-        final boolean round;
-        final String group;  // moved together in the layout editor
-        float cx, cy, w, h;  // centre and size (px)
-        int pressCount;
-        Button(String label, int bit, boolean round, String group) {
-            this.label = label;
-            this.bit = bit;
-            this.round = round;
-            this.group = group;
+    // Look: dark, warm, semi-transparent; pale gold when pressed.
+    private static final int FILL_IDLE = 0x7014110D, FILL_DOWN = 0xD8E6D29A, RIM = 0xD0C9A55C, RIM_DOWN = 0xFFFFF0C8,
+            TEXT_IDLE = 0xFFEDE3CC, TEXT_DOWN = 0xFF1A1610, GOLD = 0xFFC9A55C, PANEL_BG = 0xEC15120E;
+    /** Face button letter colours, so the four stay apart at a glance (0 = the normal text colour). */
+    private static final int[] ACCENT = new int[N];
+    private static final boolean[] IS_DPAD = new boolean[N], IS_SECOND = new boolean[N];
+
+    static {
+        for (int i = 0; i < N; i++) {
+            String g = HudModel.SPECS[i].group;
+            IS_DPAD[i] = g.equals("dpad");
+            IS_SECOND[i] = g.equals("dpad") || g.equals("minus") || g.equals("plus") || g.equals("l3") || g.equals("lock");
         }
-        boolean hit(float x, float y, float slop) {
-            if (round) {
-                float r = w / 2 + slop, dx = x - cx, dy = y - cy;
-                return dx * dx + dy * dy <= r * r;
-            }
-            return Math.abs(x - cx) <= w / 2 + slop && Math.abs(y - cy) <= h / 2 + slop;
-        }
+        ACCENT[HudModel.indexOfBit(HudModel.A)] = 0xFFEE8A70;
+        ACCENT[HudModel.indexOfBit(HudModel.B)] = 0xFFEBCB6A;
+        ACCENT[HudModel.indexOfBit(HudModel.X)] = 0xFF72B2EC;
+        ACCENT[HudModel.indexOfBit(HudModel.Y)] = 0xFF86CF93;
     }
 
-    private final List<Button> mButtons = new ArrayList<>();
+    private HudModel.Geo mGeo;
+    private final HudModel.Params mParams = new HudModel.Params();
+    private float mU, mW, mH, mInsetL, mInsetT, mInsetR, mInsetB;
+    // Per layout, cached so touch handling and drawing do no lookups.
+    private final float[] mAlpha = new float[N];
+    private float mStickAlpha = 1f, mCamAlpha = 1f;
+    private final HudTouch mT = new HudTouch();  // what every finger is doing
+    private final float[] mSticks = new float[4];
 
-    // Per finger (pointer id 0..15): what it does.
-    private final int[] mKind = new int[16];
-    private final Button[] mOn = new Button[16];
-    private final float[] mLastX = new float[16], mLastY = new float[16];
-
-    // Stick: fixed in place; a finger that comes down on it (or near it) drives it.
-    private int mStickPointer = -1;
-    private float mStickBaseX, mStickBaseY, mStickX, mStickY, mStickRadius;
-    // Camera stick: shown faintly only while touched; it appears under a finger that touches the right side and
-    // its base follows a finger that goes past its edge. Smaller than the left stick; `camera speed` = deflection
-    // per distance.
-    private int mRStickPointer = -1;
-    private float mRBaseX, mRBaseY, mRX, mRY, mRRadius;
-    // A thumb resting on it: the base slides under the thumb, so the camera eases to a stop instead of turning
-    // on and on. The slide fades in over the first moments of stillness (no jolt when it starts) and runs every
-    // display frame (Choreographer), with a short time constant.
-    private long mRLastMove;
+    /** A thumb resting on the camera stick slides its base under it, every display frame (Choreographer). */
     private long mRLastFrameNs;
-    private static final float REST_START_S = 0.012f, REST_RAMP_S = 0.045f;  // stillness before / to full slide
-    private static final float RECENTER_TIME_S = 0.06f;  // time constant of the slide at full strength
     private final android.view.Choreographer.FrameCallback mRecenter = new android.view.Choreographer.FrameCallback() {
         @Override
         public void doFrame(long frameNs) {
-            if (mRStickPointer < 0) return;
+            if (mT.camPointer < 0) return;
             float dt = mRLastFrameNs == 0 ? 0.016f : Math.min(0.05f, (frameNs - mRLastFrameNs) / 1e9f);
             mRLastFrameNs = frameNs;
-            float still = (android.os.SystemClock.uptimeMillis() - mRLastMove) / 1000f;
-            float ramp = sRecenter ? Math.max(0f, Math.min(1f, (still - REST_START_S) / REST_RAMP_S)) : 0f;
-            ramp = ramp * ramp * (3f - 2f * ramp);  // smoothstep
-            if (ramp > 0f && (mRX != mRBaseX || mRY != mRBaseY)) {
-                float k = 1f - (float) Math.exp(-dt * ramp / RECENTER_TIME_S);
-                mRBaseX += (mRX - mRBaseX) * k;
-                mRBaseY += (mRY - mRBaseY) * k;
-                float dx = mRX - mRBaseX, dy = mRY - mRBaseY;
-                if (dx * dx + dy * dy < 0.25f) {
-                    mRBaseX = mRX;
-                    mRBaseY = mRY;
-                }
+            if (mT.recenter(dt, SystemClock.uptimeMillis(), sRecenter)) {
                 sendState();
                 invalidate();
             }
@@ -261,8 +228,17 @@ public final class TouchControls extends View implements InputManager.InputDevic
 
     private final Paint mFill = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint mStroke = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint mThin = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint mDash = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint mText = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final RectF mRect = new RectF();
+    private final Path mPath = new Path();
+
+    /** `argb` with its opacity multiplied by k (0..1). */
+    private static int a(int argb, float k) {
+        int al = Math.round(((argb >>> 24) & 0xFF) * Math.max(0f, Math.min(1f, k)));
+        return (al << 24) | (argb & 0xFFFFFF);
+    }
 
     private TouchControls(Activity activity, float opacity, float cameraSpeed) {
         super(activity);
@@ -271,27 +247,17 @@ public final class TouchControls extends View implements InputManager.InputDevic
         mDensity = activity.getResources().getDisplayMetrics().density;
         setAlpha(Math.max(0.1f, Math.min(1.0f, opacity)));
         mStroke.setStyle(Paint.Style.STROKE);
-        mStroke.setColor(0xFFFFFFFF);
+        mThin.setStyle(Paint.Style.STROKE);
+        mDash.setStyle(Paint.Style.STROKE);
+        mDash.setPathEffect(new DashPathEffect(new float[] {7f * mDensity, 5f * mDensity}, 0f));
         mText.setColor(0xFFFFFFFF);
         mText.setTextAlign(Paint.Align.CENTER);
         mText.setFakeBoldText(true);
-        mButtons.add(new Button("A", A, true, "face"));
-        mButtons.add(new Button("B", B, true, "face"));
-        mButtons.add(new Button("X", X, true, "face"));
-        mButtons.add(new Button("Y", Y, true, "face"));
-        mButtons.add(new Button("L", L, false, "l"));
-        mButtons.add(new Button("ZL", ZL, false, "zl"));
-        mButtons.add(new Button("R", R, false, "r"));
-        mButtons.add(new Button("ZR", ZR, false, "zr"));
-        mButtons.add(new Button("−", MINUS, true, "minus"));
-        mButtons.add(new Button("+", PLUS, true, "plus"));
-        mButtons.add(new Button("▲", UP, false, "dpad"));
-        mButtons.add(new Button("▼", DOWN, false, "dpad"));
-        mButtons.add(new Button("◀", LEFT, false, "dpad"));
-        mButtons.add(new Button("▶", RIGHT, false, "dpad"));
-        mButtons.add(new Button("L3", L3, true, "l3"));
-        mButtons.add(new Button("LOCK", R3, true, "lock"));
-        for (int i = 0; i < 16; i++) mKind[i] = K_NONE;
+        for (int i = 0; i < 3; i++) mTool[i] = new RectF();
+        for (int i = 0; i < 2; i++) {
+            mSizeBtn[i] = new RectF();
+            mAlphaBtn[i] = new RectF();
+        }
         // A controller already connected (or built in, as on handhelds): start hidden.
         if (controllerConnected()) mShown = false;
         InputManager im = (InputManager) activity.getSystemService(Context.INPUT_SERVICE);
@@ -346,13 +312,16 @@ public final class TouchControls extends View implements InputManager.InputDevic
     }
 
     @Override
-    public void onInputDeviceRemoved(int deviceId) {}
+    public void onInputDeviceRemoved(int deviceId) {
+        // The last controller went away: the touch controls are the only way to play again.
+        if (!controllerConnected()) setShown(true);
+    }
 
     @Override
     public void onInputDeviceChanged(int deviceId) {}
 
     void setShown(boolean shown) {
-        if (mEditing) {  // shown while the player moves the controls; restored to `shown` after
+        if (mEditing) {  // shown while the player edits; restored to `shown` after
             mSavedShown = shown;
             return;
         }
@@ -363,18 +332,65 @@ public final class TouchControls extends View implements InputManager.InputDevic
         invalidate();
     }
 
+    /** Lets go of everything held, without telling the game (the caller sends the state). */
+    private void clearPointers() {
+        mT.clear();
+    }
+
     private void releaseAll() {
-        for (int i = 0; i < 16; i++) {
-            mKind[i] = K_NONE;
-            mOn[i] = null;
-        }
-        for (Button b : mButtons) b.pressCount = 0;
-        mStickPointer = -1;
-        mRStickPointer = -1;
+        clearPointers();
         sendState();
     }
 
+    // Android took the window away (the app went to the background, a dialog or the shade came over it): nothing can
+    // still be held, whatever the touch events did or did not say.
+    @Override
+    protected void onWindowVisibilityChanged(int visibility) {
+        super.onWindowVisibilityChanged(visibility);
+        if (visibility != View.VISIBLE) releaseAll();
+    }
+
+    @Override
+    protected void onDetachedFromWindow() {
+        super.onDetachedFromWindow();
+        android.view.Choreographer.getInstance().removeFrameCallback(mRecenter);
+        releaseAll();
+    }
+
     // ---- layout ---------------------------------------------------------------------------------------------
+
+    @Override
+    protected void onAttachedToWindow() {
+        super.onAttachedToWindow();
+        readInsets(getRootWindowInsets());
+    }
+
+    @Override
+    public WindowInsets onApplyWindowInsets(WindowInsets insets) {
+        readInsets(insets);
+        return super.onApplyWindowInsets(insets);
+    }
+
+    /** Display cutouts (a camera hole on a short edge): nothing starts under them. */
+    private void readInsets(WindowInsets in) {
+        float l = 0, t = 0, r = 0, b = 0;
+        if (in != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            android.view.DisplayCutout dc = in.getDisplayCutout();
+            if (dc != null) {
+                l = dc.getSafeInsetLeft();
+                t = dc.getSafeInsetTop();
+                r = dc.getSafeInsetRight();
+                b = dc.getSafeInsetBottom();
+            }
+        }
+        if (l != mInsetL || t != mInsetT || r != mInsetR || b != mInsetB) {
+            mInsetL = l;
+            mInsetT = t;
+            mInsetR = r;
+            mInsetB = b;
+            relayout();
+        }
+    }
 
     @Override
     protected void onSizeChanged(int w, int h, int ow, int oh) {
@@ -382,141 +398,123 @@ public final class TouchControls extends View implements InputManager.InputDevic
         layout(w, h);
     }
 
-    private Button find(int bit) {
-        for (Button b : mButtons)
-            if (b.bit == bit) return b;
-        return null;
-    }
-
-    private void place(int bit, float cx, float cy, float w, float h) {
-        Button b = find(bit);
-        b.cx = cx;
-        b.cy = cy;
-        b.w = w;
-        b.h = h;
-    }
-
     private void relayout() {
         if (getWidth() > 0 && getHeight() > 0) layout(getWidth(), getHeight());
         invalidate();
     }
 
-    private float mU, mW, mH;
-    private final Map<String, float[]> mDefault = new HashMap<>();  // default spot of each group (px)
-    private final Map<String, float[]> mPlaced = new HashMap<>();   // where it is (px)
-
-    /** A group's size factor (1 = default). */
-    private float sz(String group) {
-        float[] o = (mEditing ? mEditLayout : sLayout).get(group);
-        return o != null && o.length > 2 ? o[2] : 1f;
-    }
-
-    /** A group's spot: its default plus the player's offset, kept on screen. */
-    private float[] at(String group, float x, float y) {
-        mDefault.put(group, new float[] {x, y});
-        float[] o = (mEditing ? mEditLayout : sLayout).get(group);
-        float px = x, py = y;
-        if (o != null) {
-            px += o[0] * mU;
-            py += o[1] * mU;
-        }
-        float m = 0.6f * mU;
-        px = Math.max(m, Math.min(mW - m, px));
-        py = Math.max(m, Math.min(mH - m, py));
-        float[] p = {px, py};
-        mPlaced.put(group, p);
-        return p;
+    private HudModel.Layout layoutNow() {
+        return mEditing ? mEditLayout : sLayout;
     }
 
     private void layout(int w, int h) {
-        final float u = Math.min(w, h) / 10f;  // layout unit: a tenth of the short side
-        mU = u;
         mW = w;
         mH = h;
-        // Face buttons, Switch layout (X top, A right, B bottom, Y left).
-        float[] f = at("face", w - 3.0f * u, h - 3.0f * u);
-        final float fs = sz("face"), fcx = f[0], fcy = f[1], d = 1.45f * u * fs, fb = 1.3f * u * fs;
-        place(A, fcx + d, fcy, fb, fb);
-        place(B, fcx, fcy + d, fb, fb);
-        place(X, fcx, fcy - d, fb, fb);
-        place(Y, fcx - d, fcy, fb, fb);
-        float[] p = at("lock", w - 5.6f * u, h - 1.2f * u);
-        place(R3, p[0], p[1], 1.3f * u * sz("lock"), 1.3f * u * sz("lock"));
-        // Shoulders: ZL / ZR in the top corners, L / R below them.
-        final float sw = 2.4f * u, sh = 1.1f * u;
-        p = at("zl", 1.7f * u, 1.0f * u);
-        place(ZL, p[0], p[1], sw * sz("zl"), sh * sz("zl"));
-        p = at("l", 1.7f * u, 2.5f * u);
-        place(L, p[0], p[1], sw * sz("l"), sh * sz("l"));
-        p = at("zr", w - 1.7f * u, 1.0f * u);
-        place(ZR, p[0], p[1], sw * sz("zr"), sh * sz("zr"));
-        p = at("r", w - 1.7f * u, 2.5f * u);
-        place(R, p[0], p[1], sw * sz("r"), sh * sz("r"));
-        // Minus / plus at the top centre.
-        p = at("minus", w / 2f - 1.3f * u, 0.9f * u);
-        place(MINUS, p[0], p[1], 1.0f * u * sz("minus"), 1.0f * u * sz("minus"));
-        p = at("plus", w / 2f + 1.3f * u, 0.9f * u);
-        place(PLUS, p[0], p[1], 1.0f * u * sz("plus"), 1.0f * u * sz("plus"));
-        // D-pad, bottom, right of the stick.
-        p = at("dpad", 6.9f * u, h - 2.0f * u);
-        final float dps = sz("dpad"), dcx = p[0], dcy = p[1], ds = 0.95f * u * dps, db = 0.9f * u * dps;
-        place(UP, dcx, dcy - ds, db, db);
-        place(DOWN, dcx, dcy + ds, db, db);
-        place(LEFT, dcx - ds, dcy, db, db);
-        place(RIGHT, dcx + ds, dcy, db, db);
-        p = at("l3", 4.7f * u, h - 0.9f * u);
-        place(L3, p[0], p[1], 1.0f * u * sz("l3"), 1.0f * u * sz("l3"));
-        // Stick: resting spot, and the area where a finger grabs it.
-        mStickRadius = 1.6f * u * sz("stick");
-        mRRadius = 1.05f * u;
-        p = at("stick", 2.8f * u, h - 3.0f * u);
-        mStickBaseX = p[0];
-        mStickBaseY = p[1];
-        mText.setTextSize(0.45f * u);
-        mStroke.setStrokeWidth(Math.max(2f, 0.05f * u));
-        // Layout editor: Save / Reset / Cancel in the middle of the screen, the size row (- size +) below them.
-        final float bw = 3.0f * u, bh = 1.0f * u, gap = 0.4f * u, ty = h * 0.5f;
-        for (int i = 0; i < 3; i++) {
-            float cx = w / 2f + (i - 1) * (bw + gap);
-            mTool[i].set(cx - bw / 2, ty - bh / 2, cx + bw / 2, ty + bh / 2);
+        final Style st = sStyle;
+        mParams.buttonScale = st.size;
+        mParams.stickScale = st.stickSize;
+        mParams.spacing = st.spacing;
+        mParams.insetL = mInsetL;
+        mParams.insetT = mInsetT;
+        mParams.insetR = mInsetR;
+        mParams.insetB = mInsetB;
+        final HudModel.Layout lay = layoutNow();
+        mGeo = HudModel.compute(lay, w, h, mParams);
+        mT.geo = mGeo;
+        mT.floating = st.floating;
+        mT.deadzone = st.deadzone;
+        mT.cameraSpeed = mCameraSpeed;
+        mT.insetL = mInsetL;
+        mT.insetR = mInsetR;
+        mU = mGeo.u;
+        for (int i = 0; i < N; i++) {
+            HudModel.Cfg c = lay.get(HudModel.SPECS[i].group);
+            mAlpha[i] = c.alpha;
+            mT.hidden[i] = c.hidden;
         }
-        final float sb = 1.0f * u, sy = ty + bh / 2 + 0.35f * u + sb / 2, sx = 2.6f * u;
-        mSizeBtn[0].set(w / 2f - sx - sb / 2, sy - sb / 2, w / 2f - sx + sb / 2, sy + sb / 2);
-        mSizeBtn[1].set(w / 2f + sx - sb / 2, sy - sb / 2, w / 2f + sx + sb / 2, sy + sb / 2);
+        HudModel.Cfg c = lay.get("stick");
+        mStickAlpha = c.alpha;
+        mT.stickHidden = c.hidden;
+        c = lay.get("cam");
+        mCamAlpha = c.alpha;
+        mT.camHidden = c.hidden;
+        mT.cameraRadius = 1.05f * mU;
+        mText.setTextSize(0.45f * mU);
+        mStroke.setStrokeWidth(Math.max(2f, 0.05f * mU));
+        mThin.setStrokeWidth(Math.max(1f, 0.02f * mU));
+        mDash.setStrokeWidth(Math.max(1.5f, 0.03f * mU));
+        layoutPanel();
     }
 
-    // ---- layout editor --------------------------------------------------------------------------------------
+    // ---- HUD editor -----------------------------------------------------------------------------------------
+    // Drag an element to move it; drag the corner handle (or pinch with a second finger) to resize it; the panel
+    // changes size / opacity in steps, hides or shows it, and puts it back. Nothing here reaches the game: while the
+    // editor is open every touch goes to editTouch, and the controls' own state was released when it opened.
 
     private boolean mEditing, mEditTemp, mSavedShown;
     private float mSavedAlpha;
     private Runnable mEditDone;
-    private Map<String, float[]> mEditLayout = new HashMap<>();
-    private int mDragPointer = -1;
-    private String mDragGroup;
-    private float mDragX, mDragY;
-    private final RectF[] mTool = {new RectF(), new RectF(), new RectF()};  // Save, Reset, Cancel
-    private final RectF[] mSizeBtn = {new RectF(), new RectF()};  // smaller, bigger (the selected group)
-    private String mSelGroup;  // the group last touched: what - / + resize
-    private int mPinchPointer = -1;  // a second finger while a group is held: pinch to resize it
+    private HudModel.Layout mEditLayout = new HudModel.Layout();
+    private static final int D_NONE = 0, D_MOVE = 1, D_RESIZE = 2, D_PANEL = 3;
+    private int mDragMode = D_NONE, mDragPointer = -1;
+    private String mDragGroup, mSelGroup;
+    private float mDragX, mDragY, mPivotX, mPivotY, mResize0, mSize0;
+    private int mPinchPointer = -1;  // a second finger while an element is held: pinch to resize it
     private float mPinchDist, mPinchSize;
+    private final RectF mPanel = new RectF(), mHead = new RectF(), mHideBtn = new RectF(), mOneBtn = new RectF();
+    private final RectF[] mTool = new RectF[3];  // Save, Reset all, Cancel
+    private final RectF[] mSizeBtn = new RectF[2], mAlphaBtn = new RectF[2];  // smaller / bigger, fainter / stronger
+    private float mPanelDX, mPanelDY;  // the panel, moved by the player (it can be in the way)
+    private long mCancelArmedAt, mResetArmedAt;  // a second tap within 2.5 s confirms
+    private static final long CONFIRM_MS = 2500;
 
-    /** Sets a group's offset in the editor, keeping its size. */
-    private void putOffset(String g, float dx, float dy) {
-        float[] o = mEditLayout.get(g);
-        mEditLayout.put(g, new float[] {dx, dy, o != null && o.length > 2 ? o[2] : 1f});
-    }
-
-    /** Sets a group's size in the editor, keeping its offset. */
-    private void putSize(String g, float size) {
-        float[] o = mEditLayout.get(g);
-        size = Math.max(SIZE_MIN, Math.min(SIZE_MAX, Math.round(size * 100f) / 100f));
-        mEditLayout.put(g, new float[] {o != null ? o[0] : 0f, o != null ? o[1] : 0f, size});
-        relayout();
+    private void layoutPanel() {
+        final float u = mU, pw = 11.6f * u, ph = 5.5f * u;
+        mPanelDX = Math.max(-(mW - pw) / 2f, Math.min((mW - pw) / 2f, mPanelDX));
+        mPanelDY = Math.max(-(mH - ph) / 2f, Math.min((mH - ph) / 2f, mPanelDY));
+        final float left = (mW - pw) / 2f + mPanelDX, top = (mH - ph) / 2f + mPanelDY;
+        mPanel.set(left, top, left + pw, top + ph);
+        mHead.set(left, top, left + pw, top + 0.95f * u);
+        final float bh = 0.95f * u, gap = 0.3f * u;
+        // Row 1: Save / Reset all / Cancel.
+        final float tw = 3.6f * u, rowX = left + (pw - (3 * tw + 2 * gap)) / 2f, y1 = top + 1.95f * u;
+        for (int i = 0; i < 3; i++) mTool[i].set(rowX + i * (tw + gap), y1, rowX + i * (tw + gap) + tw, y1 + bh);
+        // Row 2: size and opacity of the selected element: [-] value [+].
+        final float y2 = top + 3.15f * u, sq = 1.0f * u, vw = 3.0f * u, gw = sq + vw + sq, gx = left + (pw - (2 * gw + 0.4f * u)) / 2f;
+        mSizeBtn[0].set(gx, y2, gx + sq, y2 + bh);
+        mSizeBtn[1].set(gx + sq + vw, y2, gx + gw, y2 + bh);
+        final float gx2 = gx + gw + 0.4f * u;
+        mAlphaBtn[0].set(gx2, y2, gx2 + sq, y2 + bh);
+        mAlphaBtn[1].set(gx2 + sq + vw, y2, gx2 + gw, y2 + bh);
+        // Row 3: hide / show and put back.
+        final float y3 = top + 4.35f * u, hw = 5.4f * u, hx = left + (pw - (2 * hw + gap)) / 2f;
+        mHideBtn.set(hx, y3, hx + hw, y3 + bh);
+        mOneBtn.set(hx + hw + gap, y3, hx + 2 * hw + gap, y3 + bh);
     }
 
     private static float distance(MotionEvent e, int a, int b) {
         float dx = e.getX(a) - e.getX(b), dy = e.getY(a) - e.getY(b);
         return (float) Math.sqrt(dx * dx + dy * dy);
+    }
+
+    private void putOffset(String g, float dx, float dy) {
+        HudModel.Cfg c = mEditLayout.edit(g);
+        c.dx = dx;
+        c.dy = dy;
+    }
+
+    private void putSize(String g, float size) {
+        mEditLayout.edit(g).size = Math.max(HudModel.SIZE_MIN, Math.min(HudModel.SIZE_MAX, Math.round(size * 100f) / 100f));
+        relayout();
+    }
+
+    private void putAlpha(String g, float alpha) {
+        mEditLayout.edit(g).alpha = Math.max(HudModel.ALPHA_MIN, Math.min(1f, Math.round(alpha * 100f) / 100f));
+        relayout();
+    }
+
+    private boolean dirty() {
+        return !HudModel.format(mEditLayout).equals(HudModel.format(sLayout));
     }
 
     private void startEdit(boolean temp, Runnable done) {
@@ -528,13 +526,13 @@ public final class TouchControls extends View implements InputManager.InputDevic
         mShown = true;
         mSavedAlpha = getAlpha();
         setAlpha(Math.max(0.85f, mSavedAlpha));
-        mEditLayout = new HashMap<>();
-        for (Map.Entry<String, float[]> e : sLayout.entrySet())
-            mEditLayout.put(e.getKey(), e.getValue().clone());
+        mEditLayout = sLayout.copy();
+        mDragMode = D_NONE;
         mDragPointer = -1;
         mDragGroup = null;
         mSelGroup = null;
         mPinchPointer = -1;
+        mCancelArmedAt = mResetArmedAt = 0;
         relayout();
     }
 
@@ -542,11 +540,12 @@ public final class TouchControls extends View implements InputManager.InputDevic
         if (!mEditing) return;
         if (save) {
             sLayout = mEditLayout;
-            if (!SettingsMenu.writeSetting("touch_layout", formatLayout(mEditLayout)))
+            if (!SettingsMenu.writeSetting("touch_layout", HudModel.format(mEditLayout)))
                 android.util.Log.w("DSRNative", "touch controls: could not save the layout");
         }
         mEditing = false;
         sEditing = false;
+        mDragMode = D_NONE;
         mDragPointer = -1;
         mDragGroup = null;
         setAlpha(mSavedAlpha);
@@ -567,11 +566,74 @@ public final class TouchControls extends View implements InputManager.InputDevic
         if (done != null) done.run();
     }
 
+    /** The element under a finger in the editor: a button (hidden ones too), the stick, or the camera area. */
     private String groupAt(float x, float y) {
-        Button b = hit(x, y);
-        if (b != null) return b.group;
-        float dx = x - mStickBaseX, dy = y - mStickBaseY, r = mStickRadius * 1.1f;
-        return dx * dx + dy * dy <= r * r ? "stick" : null;
+        int b = mT.hit(x, y, true);
+        if (b >= 0) return HudModel.SPECS[b].group;
+        float dx = x - mGeo.stickX, dy = y - mGeo.stickY, r = mGeo.stickR * 1.1f;
+        if (dx * dx + dy * dy <= r * r) return "stick";
+        if (x >= mGeo.camL && x <= mGeo.camR && y >= mGeo.camT && y <= mGeo.camB) return "cam";
+        return null;
+    }
+
+    /** The resize handle of an element: at the bottom right of it, kept on screen. */
+    private float[] handlePos(String g) {
+        float[] b = HudModel.bounds(mGeo, g);
+        float m = 0.5f * mU;
+        return new float[] {Math.min(b[2], mW - m), Math.min(b[3], mH - m)};
+    }
+
+    /** A finger came down on the editor panel. Returns true when the editor closed. */
+    private boolean panelDown(int id, float x, float y) {
+        final long now = SystemClock.uptimeMillis();
+        if (mTool[0].contains(x, y)) {
+            endEdit(true);
+            return true;
+        }
+        if (mTool[1].contains(x, y)) {  // Reset all: tap twice
+            if (now - mResetArmedAt < CONFIRM_MS) {
+                mEditLayout = new HudModel.Layout();
+                mSelGroup = null;
+                mResetArmedAt = 0;
+                relayout();
+            } else {
+                mResetArmedAt = now;
+                postDelayed(this::invalidate, CONFIRM_MS + 50);
+            }
+            return false;
+        }
+        if (mTool[2].contains(x, y)) {  // Cancel: nothing changed closes at once, otherwise tap twice
+            if (!dirty() || now - mCancelArmedAt < CONFIRM_MS) {
+                endEdit(false);
+                return true;
+            }
+            mCancelArmedAt = now;
+            postDelayed(this::invalidate, CONFIRM_MS + 50);
+            return false;
+        }
+        if (mSelGroup != null) {
+            final HudModel.Cfg c = mEditLayout.get(mSelGroup);
+            if (mSizeBtn[0].contains(x, y)) putSize(mSelGroup, c.size - HudModel.SIZE_STEP);
+            else if (mSizeBtn[1].contains(x, y)) putSize(mSelGroup, c.size + HudModel.SIZE_STEP);
+            else if (mAlphaBtn[0].contains(x, y)) putAlpha(mSelGroup, c.alpha - HudModel.ALPHA_STEP);
+            else if (mAlphaBtn[1].contains(x, y)) putAlpha(mSelGroup, c.alpha + HudModel.ALPHA_STEP);
+            else if (mHideBtn.contains(x, y)) {
+                if (HudModel.canHide(mSelGroup)) {
+                    mEditLayout.edit(mSelGroup).hidden = !c.hidden;
+                    relayout();
+                }
+            } else if (mOneBtn.contains(x, y)) {  // this element back to its default spot, size, opacity and visibility
+                mEditLayout.cfg.remove(mSelGroup);
+                relayout();
+            }
+        }
+        if (mHead.contains(x, y)) {  // the title bar moves the panel
+            mDragMode = D_PANEL;
+            mDragPointer = id;
+            mDragX = x;
+            mDragY = y;
+        }
+        return false;
     }
 
     private void editTouch(MotionEvent e) {
@@ -580,43 +642,44 @@ public final class TouchControls extends View implements InputManager.InputDevic
             case MotionEvent.ACTION_POINTER_DOWN: {
                 int i = e.getActionIndex();
                 float x = e.getX(i), y = e.getY(i);
-                if (mDragPointer >= 0) {  // a second finger while a group is held: pinch resizes that group
+                if (mDragPointer >= 0) {  // a second finger while an element is held: pinch resizes it
                     int d = e.findPointerIndex(mDragPointer);
-                    if (mPinchPointer < 0 && d >= 0 && mDragGroup != null) {
+                    if (mPinchPointer < 0 && mDragMode == D_MOVE && d >= 0 && mDragGroup != null) {
                         mPinchPointer = e.getPointerId(i);
                         mPinchDist = Math.max(1f, distance(e, d, i));
-                        mPinchSize = sz(mDragGroup);
+                        mPinchSize = mEditLayout.get(mDragGroup).size;
                     }
                     break;
                 }
-                if (mSelGroup != null && mSizeBtn[0].contains(x, y)) {
-                    putSize(mSelGroup, sz(mSelGroup) - SIZE_STEP);
+                if (mPanel.contains(x, y)) {
+                    if (panelDown(e.getPointerId(i), x, y)) return;
                     break;
                 }
-                if (mSelGroup != null && mSizeBtn[1].contains(x, y)) {
-                    putSize(mSelGroup, sz(mSelGroup) + SIZE_STEP);
-                    break;
-                }
-                if (mTool[0].contains(x, y)) {
-                    endEdit(true);
-                    return;
-                }
-                if (mTool[1].contains(x, y)) {
-                    mEditLayout = new HashMap<>();
-                    relayout();
-                    break;
-                }
-                if (mTool[2].contains(x, y)) {
-                    endEdit(false);
-                    return;
+                if (mSelGroup != null) {  // the corner handle of the selected element
+                    float[] hp = handlePos(mSelGroup);
+                    float dx = x - hp[0], dy = y - hp[1], r = 0.8f * mU;
+                    if (dx * dx + dy * dy <= r * r) {
+                        float[] b = HudModel.bounds(mGeo, mSelGroup);
+                        mPivotX = (b[0] + b[2]) / 2f;
+                        mPivotY = (b[1] + b[3]) / 2f;
+                        mResize0 = Math.max(1f, (float) Math.hypot(x - mPivotX, y - mPivotY));
+                        mSize0 = mEditLayout.get(mSelGroup).size;
+                        mDragMode = D_RESIZE;
+                        mDragPointer = e.getPointerId(i);
+                        mDragGroup = mSelGroup;
+                        break;
+                    }
                 }
                 String g = groupAt(x, y);
                 if (g != null) {
+                    mDragMode = D_MOVE;
                     mDragPointer = e.getPointerId(i);
                     mDragGroup = g;
                     mSelGroup = g;
                     mDragX = x;
                     mDragY = y;
+                } else {
+                    mSelGroup = null;
                 }
                 break;
             }
@@ -625,6 +688,18 @@ public final class TouchControls extends View implements InputManager.InputDevic
                 int i = e.findPointerIndex(mDragPointer);
                 if (i < 0) break;
                 float x = e.getX(i), y = e.getY(i);
+                if (mDragMode == D_PANEL) {
+                    mPanelDX += x - mDragX;
+                    mPanelDY += y - mDragY;
+                    mDragX = x;
+                    mDragY = y;
+                    layoutPanel();
+                    break;
+                }
+                if (mDragMode == D_RESIZE) {
+                    putSize(mDragGroup, mSize0 * (float) Math.hypot(x - mPivotX, y - mPivotY) / mResize0);
+                    break;
+                }
                 if (mPinchPointer >= 0) {  // pinching: resize, no move
                     int j = e.findPointerIndex(mPinchPointer);
                     if (j >= 0) putSize(mDragGroup, mPinchSize * distance(e, i, j) / mPinchDist);
@@ -632,17 +707,16 @@ public final class TouchControls extends View implements InputManager.InputDevic
                     mDragY = y;
                     break;
                 }
-                float[] def = mDefault.get(mDragGroup), cur = mPlaced.get(mDragGroup);
+                float[] def = mGeo.dflt.get(mDragGroup), cur = mGeo.placed.get(mDragGroup);
                 if (def == null || cur == null || mU <= 0) break;
-                // New spot = where it is + the finger's move; kept on screen by layout().
+                // New spot = where it is + the finger's move; kept on screen by the layout.
                 float nx = cur[0] + (x - mDragX), ny = cur[1] + (y - mDragY);
                 putOffset(mDragGroup, (nx - def[0]) / mU, (ny - def[1]) / mU);
                 mDragX = x;
                 mDragY = y;
                 relayout();
-                float[] placed = mPlaced.get(mDragGroup);  // clamped: keep the offset where it stopped
-                if (placed != null)
-                    putOffset(mDragGroup, (placed[0] - def[0]) / mU, (placed[1] - def[1]) / mU);
+                float[] placed = mGeo.placed.get(mDragGroup);  // clamped: keep the offset where it stopped
+                if (placed != null) putOffset(mDragGroup, (placed[0] - def[0]) / mU, (placed[1] - def[1]) / mU);
                 break;
             }
             case MotionEvent.ACTION_UP:
@@ -657,6 +731,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
                     }
                 }
                 if (id == mDragPointer) {
+                    mDragMode = D_NONE;
                     mDragPointer = -1;
                     mDragGroup = null;
                     mPinchPointer = -1;
@@ -664,6 +739,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
                 break;
             }
             case MotionEvent.ACTION_CANCEL:
+                mDragMode = D_NONE;
                 mDragPointer = -1;
                 mDragGroup = null;
                 mPinchPointer = -1;
@@ -672,49 +748,6 @@ public final class TouchControls extends View implements InputManager.InputDevic
                 break;
         }
         invalidate();
-    }
-
-    private void drawEditor(Canvas c) {
-        final float u = mU;
-        String[] labels = {Strings.t("save"), Strings.t("reset"), Strings.t("cancel")};
-        float size = mText.getTextSize();
-        mText.setTextSize(0.4f * u);
-        for (int i = 0; i < 3; i++) {
-            RectF r = mTool[i];
-            mFill.setColor(i == 0 ? 0xFFC9A55C : 0xF0242424);
-            c.drawRoundRect(r, 0.25f * u, 0.25f * u, mFill);
-            c.drawRoundRect(r, 0.25f * u, 0.25f * u, mStroke);
-            mText.setColor(i == 0 ? 0xFF151515 : 0xFFFFFFFF);
-            c.drawText(labels[i], r.centerX(), r.centerY() - (mText.descent() + mText.ascent()) / 2, mText);
-        }
-        // Size row: - / + for the selected group, its size between them.
-        for (int i = 0; i < 2; i++) {
-            RectF r = mSizeBtn[i];
-            mFill.setColor(mSelGroup != null ? 0xF0242424 : 0x90242424);
-            c.drawRoundRect(r, 0.25f * u, 0.25f * u, mFill);
-            c.drawRoundRect(r, 0.25f * u, 0.25f * u, mStroke);
-            mText.setColor(mSelGroup != null ? 0xFFFFFFFF : 0x80FFFFFF);
-            mText.setTextSize(0.6f * u);
-            c.drawText(i == 0 ? "\u2212" : "+", r.centerX(), r.centerY() - (mText.descent() + mText.ascent()) / 2, mText);
-        }
-        mText.setTextSize(0.38f * u);
-        String sizeText = mSelGroup == null ? Strings.t("size_pick")
-                : Strings.t("size_of", Math.round(sz(mSelGroup) * 100f));
-        float sw2 = mText.measureText(sizeText), scy = mSizeBtn[0].centerY();
-        mRect.set(mW / 2f - sw2 / 2 - 0.3f * u, scy - 0.4f * u, mW / 2f + sw2 / 2 + 0.3f * u, scy + 0.4f * u);
-        mFill.setColor(0xD0000000);
-        c.drawRoundRect(mRect, 0.2f * u, 0.2f * u, mFill);
-        mText.setColor(0xFFFFFFFF);
-        c.drawText(sizeText, mW / 2f, scy - (mText.descent() + mText.ascent()) / 2, mText);
-        String help = Strings.t("edit_help");
-        float tw = mText.measureText(help);
-        float ty = mTool[0].top - 0.75f * u;
-        mRect.set(mW / 2f - tw / 2 - 0.4f * u, ty - 0.45f * u, mW / 2f + tw / 2 + 0.4f * u, ty + 0.45f * u);
-        mFill.setColor(0xD0000000);
-        c.drawRoundRect(mRect, 0.2f * u, 0.2f * u, mFill);
-        mText.setColor(0xFFFFFFFF);
-        c.drawText(help, mW / 2f, ty - (mText.descent() + mText.ascent()) / 2, mText);
-        mText.setTextSize(size);
     }
 
     // ---- touch ----------------------------------------------------------------------------------------------
@@ -730,24 +763,29 @@ public final class TouchControls extends View implements InputManager.InputDevic
             if (action == MotionEvent.ACTION_DOWN) checkDoubleTap(e.getX(), e.getY());
             return true;
         }
+        if (mGeo == null) return true;
         switch (action) {
-            case MotionEvent.ACTION_DOWN:
+            case MotionEvent.ACTION_DOWN: {
+                clearPointers();  // a new gesture starts with no finger down: nothing can still be held from before
+                down(e.getPointerId(0), e.getX(0), e.getY(0));
+                break;
+            }
             case MotionEvent.ACTION_POINTER_DOWN: {
                 int i = e.getActionIndex();
                 down(e.getPointerId(i), e.getX(i), e.getY(i));
                 break;
             }
             case MotionEvent.ACTION_MOVE:
-                for (int i = 0; i < e.getPointerCount(); i++) move(e.getPointerId(i), e.getX(i), e.getY(i));
+                for (int i = 0; i < e.getPointerCount(); i++) mT.move(e.getPointerId(i), e.getX(i), e.getY(i), SystemClock.uptimeMillis());
                 break;
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_POINTER_UP: {
                 int i = e.getActionIndex();
-                up(e.getPointerId(i));
+                mT.up(e.getPointerId(i));
                 break;
             }
             case MotionEvent.ACTION_CANCEL:
-                releaseAll();
+                clearPointers();
                 break;
             default:
                 break;
@@ -770,183 +808,208 @@ public final class TouchControls extends View implements InputManager.InputDevic
         }
     }
 
-    private Button hit(float x, float y) {
-        float slop = 0.15f * Math.min(getWidth(), getHeight()) / 10f;
-        Button best = null;
-        float bestDist = Float.MAX_VALUE;
-        for (Button b : mButtons)
-            if (b.hit(x, y, slop)) {
-                float dx = x - b.cx, dy = y - b.cy, dist = dx * dx + dy * dy;
-                if (dist < bestDist) {
-                    bestDist = dist;
-                    best = b;
-                }
-            }
-        return best;
-    }
-
     private void down(int id, float x, float y) {
-        if (id < 0 || id >= 16) return;
-        mLastX[id] = x;
-        mLastY[id] = y;
-        Button b = hit(x, y);
-        if (b != null) {
-            mKind[id] = K_BUTTON;
-            mOn[id] = b;
-            b.pressCount++;
-        } else if (mStickPointer < 0 && onStick(x, y)) {
-            mKind[id] = K_STICK;
-            mStickPointer = id;
-            mStickX = x;
-            mStickY = y;
-        } else if (mRStickPointer < 0 && x > getWidth() * 0.5f) {
-            mKind[id] = K_RSTICK;
-            mRStickPointer = id;
-            mRBaseX = mRX = x;
-            mRBaseY = mRY = y;
-            mRLastMove = android.os.SystemClock.uptimeMillis();
+        mT.down(id, x, y, SystemClock.uptimeMillis());
+        if (mT.camPointer == id) {  // the camera stick starts: the thumb-rest slide runs every frame while it is held
             mRLastFrameNs = 0;
             android.view.Choreographer.getInstance().removeFrameCallback(mRecenter);
             android.view.Choreographer.getInstance().postFrameCallback(mRecenter);
-        } else {
-            mKind[id] = K_NONE;
         }
-    }
-
-    private boolean onStick(float x, float y) {
-        float dx = x - mStickBaseX, dy = y - mStickBaseY, r = mStickRadius * 1.5f;
-        return dx * dx + dy * dy <= r * r;
-    }
-
-    private void move(int id, float x, float y) {
-        if (id < 0 || id >= 16) return;
-        switch (mKind[id]) {
-            case K_BUTTON: {  // slide between buttons (e.g. across the face buttons)
-                Button b = hit(x, y);
-                if (b != mOn[id]) {
-                    if (mOn[id] != null) mOn[id].pressCount--;
-                    mOn[id] = b;
-                    if (b != null) b.pressCount++;
-                }
-                break;
-            }
-            case K_STICK:
-                mStickX = x;
-                mStickY = y;
-                break;
-            case K_RSTICK: {
-                if (x != mRX || y != mRY) mRLastMove = android.os.SystemClock.uptimeMillis();
-                mRX = x;
-                mRY = y;
-                float dx = x - mRBaseX, dy = y - mRBaseY, len = (float) Math.sqrt(dx * dx + dy * dy);
-                if (len > mRRadius) {  // the base follows the finger
-                    mRBaseX = x - dx / len * mRRadius;
-                    mRBaseY = y - dy / len * mRRadius;
-                }
-                break;
-            }
-            default:
-                break;
-        }
-        mLastX[id] = x;
-        mLastY[id] = y;
-    }
-
-    private void up(int id) {
-        if (id < 0 || id >= 16) return;
-        if (mKind[id] == K_BUTTON && mOn[id] != null) mOn[id].pressCount--;
-        if (mKind[id] == K_STICK) mStickPointer = -1;
-        if (mKind[id] == K_RSTICK) mRStickPointer = -1;
-        mKind[id] = K_NONE;
-        mOn[id] = null;
     }
 
     private void sendState() {
-        int bits = 0;
-        for (Button b : mButtons)
-            if (b.pressCount > 0) bits |= b.bit;
-        float lx = 0, ly = 0;
-        if (mStickPointer >= 0) {
-            float dx = mStickX - mStickBaseX, dy = mStickY - mStickBaseY;
-            float len = (float) Math.sqrt(dx * dx + dy * dy);
-            if (len > mStickRadius) {  // past the edge: full tilt in that direction
-                dx = dx / len * mStickRadius;
-                dy = dy / len * mStickRadius;
-            }
-            lx = dx / mStickRadius;
-            ly = -dy / mStickRadius;
-            if (Math.abs(lx) < 0.08f && Math.abs(ly) < 0.08f) lx = ly = 0;
-        }
-        float rx = 0, ry = 0;
-        if (mRStickPointer >= 0) {
-            // Full tilt at 1 / speed of the ring's radius (speed 1: at the edge).
-            float reach = mRRadius / mCameraSpeed;
-            rx = Math.max(-1f, Math.min(1f, (mRX - mRBaseX) / reach));
-            ry = Math.max(-1f, Math.min(1f, -(mRY - mRBaseY) / reach));
-            if (Math.abs(rx) < 0.06f && Math.abs(ry) < 0.06f) rx = ry = 0;
-        }
-        nativeState(bits, lx, ly, rx, ry);
+        mT.sticks(mSticks);
+        nativeState(mT.buttons(), mSticks[0], mSticks[1], mSticks[2], mSticks[3]);
     }
 
     // ---- drawing --------------------------------------------------------------------------------------------
+    // Nothing is allocated while drawing a normal frame; the editor's overlays allocate a little (editing only).
 
     @Override
     protected void onDraw(Canvas c) {
-        if (!mShown) return;
-        if (mEditing) c.drawColor(0x50000000);
-        // Stick (the knob stays inside the ring).
-        final float bx = mStickBaseX, by = mStickBaseY;
-        mFill.setColor(mEditing && ("stick".equals(mDragGroup) || "stick".equals(mSelGroup)) ? 0xA0C9A55C : 0x40000000);
-        c.drawCircle(bx, by, mStickRadius, mFill);
-        c.drawCircle(bx, by, mStickRadius, mStroke);
+        if (!mShown || mGeo == null) return;
+        if (mEditing) {
+            c.drawColor(0x50000000);
+            drawCameraArea(c);
+        }
+        final Style st = sStyle;
+        drawStick(c, st);
+        drawCameraStick(c);
+        for (int i = 0; i < N; i++) drawButton(c, i, st);
+        if (mEditing) drawEditor(c);
+    }
+
+    private void drawStick(Canvas c, Style st) {
+        if (mT.stickHidden && !mEditing) return;
+        float k = mStickAlpha * (mT.stickHidden ? 0.35f : 1f);
+        final boolean active = mT.stickPointer >= 0;
+        if (st.floating && !active) k *= 0.6f;  // resting spot of a floating stick: a faint marker
+        final float bx = mT.stickBaseX(), by = mT.stickBaseY(), r = mGeo.stickR;
+        mFill.setColor(a(FILL_IDLE, k));
+        c.drawCircle(bx, by, r, mFill);
+        if (st.outline) {
+            mStroke.setColor(a(RIM, k));
+            c.drawCircle(bx, by, r, mStroke);
+        }
+        mThin.setColor(a(0x50FFFFFF, k));
+        c.drawCircle(bx, by, r * 0.55f, mThin);
         float kx = bx, ky = by;
-        if (mStickPointer >= 0) {
-            float dx = mStickX - bx, dy = mStickY - by, len = (float) Math.sqrt(dx * dx + dy * dy);
-            if (len > mStickRadius) {
-                dx = dx / len * mStickRadius;
-                dy = dy / len * mStickRadius;
+        if (active) {  // the thumb stays inside the ring
+            float dx = mT.stickX - bx, dy = mT.stickY - by, len = (float) Math.sqrt(dx * dx + dy * dy);
+            if (len > r) {
+                dx = dx / len * r;
+                dy = dy / len * r;
             }
             kx = bx + dx;
             ky = by + dy;
         }
-        mFill.setColor(mStickPointer >= 0 ? 0xA0FFFFFF : 0x60FFFFFF);
-        c.drawCircle(kx, ky, mStickRadius * 0.45f, mFill);
-        // Camera stick, only while touched, faint: 10% opaque on screen (whatever touch_opacity is).
-        if (mRStickPointer >= 0) {
-            final int a = Math.max(1, Math.min(255, Math.round(255 * 0.10f / Math.max(0.1f, getAlpha()))));
-            mFill.setColor(a << 24);
-            c.drawCircle(mRBaseX, mRBaseY, mRRadius, mFill);
-            mStroke.setAlpha(a);
-            c.drawCircle(mRBaseX, mRBaseY, mRRadius, mStroke);
-            mStroke.setAlpha(0xFF);
-            float dx = mRX - mRBaseX, dy = mRY - mRBaseY, len = (float) Math.sqrt(dx * dx + dy * dy);
-            if (len > mRRadius) {
-                dx = dx / len * mRRadius;
-                dy = dy / len * mRRadius;
-            }
-            mFill.setColor((a << 24) | 0xFFFFFF);
-            c.drawCircle(mRBaseX + dx, mRBaseY + dy, mRRadius * 0.45f, mFill);
+        mFill.setColor(a(active ? 0xC8E6D29A : 0x78D8C28C, k));
+        c.drawCircle(kx, ky, r * 0.42f, mFill);
+        if (st.outline) {
+            mStroke.setColor(a(active ? RIM_DOWN : RIM, k));
+            c.drawCircle(kx, ky, r * 0.42f, mStroke);
         }
-        // Buttons.
-        for (Button b : mButtons) {
-            boolean on = b.pressCount > 0;
-            mFill.setColor(mEditing && (b.group.equals(mDragGroup) || b.group.equals(mSelGroup)) ? 0xC0C9A55C
-                    : on ? 0x90FFFFFF : 0x50000000);
-            if (b.round) {
-                c.drawCircle(b.cx, b.cy, b.w / 2, mFill);
-                c.drawCircle(b.cx, b.cy, b.w / 2, mStroke);
-            } else {
-                mRect.set(b.cx - b.w / 2, b.cy - b.h / 2, b.cx + b.w / 2, b.cy + b.h / 2);
-                float r = Math.min(b.w, b.h) * 0.3f;
-                c.drawRoundRect(mRect, r, r, mFill);
-                c.drawRoundRect(mRect, r, r, mStroke);
-            }
-            mText.setColor(on ? 0xFF000000 : 0xFFFFFFFF);
-            float size = mText.getTextSize();
-            if (b.label.length() > 2) mText.setTextSize(size * 0.7f);
-            c.drawText(b.label, b.cx, b.cy - (mText.descent() + mText.ascent()) / 2, mText);
+    }
+
+    /** Camera stick, only while touched, faint: 10% opaque on screen (whatever touch_opacity is). */
+    private void drawCameraStick(Canvas c) {
+        if (mT.camPointer < 0 || mEditing) return;
+        final int al = Math.max(1, Math.min(255, Math.round(255 * 0.10f * mCamAlpha / Math.max(0.1f, getAlpha()))));
+        mFill.setColor(al << 24);
+        c.drawCircle(mT.camBaseX, mT.camBaseY, mT.cameraRadius, mFill);
+        mStroke.setColor(0xFFFFFFFF);
+        mStroke.setAlpha(al);
+        c.drawCircle(mT.camBaseX, mT.camBaseY, mT.cameraRadius, mStroke);
+        mStroke.setAlpha(0xFF);
+        float dx = mT.camX - mT.camBaseX, dy = mT.camY - mT.camBaseY, len = (float) Math.sqrt(dx * dx + dy * dy);
+        if (len > mT.cameraRadius) {
+            dx = dx / len * mT.cameraRadius;
+            dy = dy / len * mT.cameraRadius;
+        }
+        mFill.setColor((al << 24) | 0xFFFFFF);
+        c.drawCircle(mT.camBaseX + dx, mT.camBaseY + dy, mT.cameraRadius * 0.45f, mFill);
+    }
+
+    private void drawButton(Canvas c, int i, Style st) {
+        if (mT.hidden[i] && !mEditing) return;
+        final HudModel.Spec sp = HudModel.SPECS[i];
+        final boolean on = mT.press[i] > 0;
+        final float k = mAlpha[i] * (IS_SECOND[i] ? SECONDARY : 1f) * (mT.hidden[i] ? 0.35f : 1f);
+        final float cx = mGeo.cx[i], cy = mGeo.cy[i], w = mGeo.bw[i], h = mGeo.bh[i], sh = on ? 0.94f : 1f;
+        mFill.setColor(a(on ? FILL_DOWN : FILL_IDLE, k));
+        mStroke.setColor(a(on ? RIM_DOWN : RIM, k));
+        if (sp.round) {
+            c.drawCircle(cx, cy, w / 2 * sh, mFill);
+            if (st.outline) c.drawCircle(cx, cy, w / 2 * sh, mStroke);
+        } else {
+            mRect.set(cx - w / 2 * sh, cy - h / 2 * sh, cx + w / 2 * sh, cy + h / 2 * sh);
+            float r = Math.min(w, h) * (IS_DPAD[i] ? 0.25f : 0.45f);
+            c.drawRoundRect(mRect, r, r, mFill);
+            if (st.outline) c.drawRoundRect(mRect, r, r, mStroke);
+        }
+        final int tc = on ? TEXT_DOWN : ACCENT[i] != 0 ? ACCENT[i] : TEXT_IDLE;
+        if (IS_DPAD[i]) {  // an arrow (an icon, so it stays when labels are off)
+            final float s = w * 0.22f;
+            final float dx = sp.bit == HudModel.LEFT ? -1 : sp.bit == HudModel.RIGHT ? 1 : 0;
+            final float dy = sp.bit == HudModel.UP ? -1 : sp.bit == HudModel.DOWN ? 1 : 0;
+            mPath.reset();
+            mPath.moveTo(cx + dx * s, cy + dy * s);
+            mPath.lineTo(cx - dx * s * 0.6f - dy * s * 0.95f, cy - dy * s * 0.6f + dx * s * 0.95f);
+            mPath.lineTo(cx - dx * s * 0.6f + dy * s * 0.95f, cy - dy * s * 0.6f - dx * s * 0.95f);
+            mPath.close();
+            mFill.setColor(a(tc, k));
+            c.drawPath(mPath, mFill);
+        } else if (st.labels) {
+            float size = Math.min(0.45f * mU, Math.min(w, h) * 0.4f);
+            if (sp.label.length() > 2) size *= 0.7f;
             mText.setTextSize(size);
+            mText.setColor(a(tc, k));
+            c.drawText(sp.label, cx, cy - (mText.descent() + mText.ascent()) / 2, mText);
         }
-        if (mEditing) drawEditor(c);
+    }
+
+    // -- editor overlays
+
+    private static String groupName(String g) {
+        return Strings.t("grp_" + g);
+    }
+
+    private void drawCameraArea(Canvas c) {
+        mRect.set(mGeo.camL, mGeo.camT, mGeo.camR, mGeo.camB);
+        mFill.setColor(mT.camHidden ? 0x10FFFFFF : 0x18FFFFFF);
+        c.drawRect(mRect, mFill);
+    }
+
+    private void label(Canvas c, String s, float cx, float cy, float size, int color) {
+        mText.setTextSize(size);
+        mText.setColor(color);
+        c.drawText(s, cx, cy - (mText.descent() + mText.ascent()) / 2, mText);
+    }
+
+    private void tool(Canvas c, RectF r, String text, boolean gold, boolean enabled) {
+        final float u = mU, rr = 0.25f * u;
+        mFill.setColor(gold ? (enabled ? GOLD : a(GOLD, 0.4f)) : (enabled ? 0xF0262320 : 0x90262320));
+        c.drawRoundRect(r, rr, rr, mFill);
+        mStroke.setColor(a(RIM, enabled ? 1f : 0.4f));
+        c.drawRoundRect(r, rr, rr, mStroke);
+        label(c, text, r.centerX(), r.centerY(), 0.4f * u, gold ? 0xFF151515 : enabled ? 0xFFFFFFFF : 0x80FFFFFF);
+    }
+
+    private void drawEditor(Canvas c) {
+        final float u = mU;
+        // Every element's outline; the selected one in gold with its resize handle.
+        for (String g : HudModel.GROUPS) {
+            final float[] b = HudModel.bounds(mGeo, g);
+            if (b[2] <= b[0]) continue;
+            final boolean sel = g.equals(mSelGroup);
+            mRect.set(b[0] - 0.1f * u, b[1] - 0.1f * u, b[2] + 0.1f * u, b[3] + 0.1f * u);
+            if (sel) {
+                mFill.setColor(g.equals(mDragGroup) ? 0x38C9A55C : 0x20C9A55C);
+                c.drawRoundRect(mRect, 0.2f * u, 0.2f * u, mFill);
+                mStroke.setColor(GOLD);
+                c.drawRoundRect(mRect, 0.2f * u, 0.2f * u, mStroke);
+            } else {
+                mDash.setColor(0x90FFFFFF);
+                c.drawRoundRect(mRect, 0.2f * u, 0.2f * u, mDash);
+            }
+        }
+        if (mSelGroup != null) {
+            final float[] hp = handlePos(mSelGroup);
+            mFill.setColor(GOLD);
+            c.drawCircle(hp[0], hp[1], 0.38f * u, mFill);
+            mStroke.setColor(0xFF151515);
+            c.drawCircle(hp[0], hp[1], 0.38f * u, mStroke);
+            final float d = 0.13f * u;  // a diagonal double arrow, drawn (a font may not have the glyph)
+            c.drawLine(hp[0] - d, hp[1] + d, hp[0] + d, hp[1] - d, mStroke);
+        }
+        // Panel.
+        final float rr = 0.3f * u;
+        mFill.setColor(PANEL_BG);
+        c.drawRoundRect(mPanel, rr, rr, mFill);
+        mStroke.setColor(0xFF4A3D22);
+        c.drawRoundRect(mPanel, rr, rr, mStroke);
+        mFill.setColor(0xFF7A6A44);  // grip dots: the title bar moves the panel
+        for (int i = 0; i < 3; i++) c.drawCircle(mHead.left + (0.45f + 0.28f * i) * u, mHead.centerY(), 0.07f * u, mFill);
+        label(c, Strings.t("edit_help"), mHead.centerX(), mHead.centerY(), 0.34f * u, 0xFFBFB59C);
+        final String name = mSelGroup == null ? Strings.t("size_pick") : groupName(mSelGroup);
+        label(c, name, mPanel.centerX(), mPanel.top + 1.45f * u, 0.42f * u, GOLD);
+        final long now = SystemClock.uptimeMillis();
+        tool(c, mTool[0], Strings.t("save"), true, true);
+        tool(c, mTool[1], now - mResetArmedAt < CONFIRM_MS ? Strings.t("ed_again") : Strings.t("ed_reset_all"), false, true);
+        tool(c, mTool[2], now - mCancelArmedAt < CONFIRM_MS ? Strings.t("ed_discard") : Strings.t("cancel"), false, true);
+        final boolean sel = mSelGroup != null;
+        final HudModel.Cfg cfg = sel ? mEditLayout.get(mSelGroup) : null;
+        tool(c, mSizeBtn[0], "\u2212", false, sel);
+        tool(c, mSizeBtn[1], "+", false, sel);
+        tool(c, mAlphaBtn[0], "\u2212", false, sel);
+        tool(c, mAlphaBtn[1], "+", false, sel);
+        label(c, sel ? Strings.t("size_of", Math.round(cfg.size * 100f)) : "\u2013",
+                (mSizeBtn[0].right + mSizeBtn[1].left) / 2f, mSizeBtn[0].centerY(), 0.36f * u, sel ? 0xFFFFFFFF : 0x80FFFFFF);
+        label(c, sel ? Strings.t("ed_opacity", Math.round(cfg.alpha * 100f)) : "\u2013",
+                (mAlphaBtn[0].right + mAlphaBtn[1].left) / 2f, mAlphaBtn[0].centerY(), 0.36f * u, sel ? 0xFFFFFFFF : 0x80FFFFFF);
+        final boolean canHide = sel && HudModel.canHide(mSelGroup);
+        tool(c, mHideBtn, !sel ? Strings.t("ed_hide") : !canHide ? Strings.t("ed_needed") : cfg.hidden ? Strings.t("ed_show") : Strings.t("ed_hide"),
+                false, canHide);
+        tool(c, mOneBtn, Strings.t("ed_reset_one"), false, sel);
     }
 }

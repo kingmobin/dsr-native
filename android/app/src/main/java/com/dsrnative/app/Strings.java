@@ -535,7 +535,7 @@ final class Strings {
                 "開：拇指停住時視角搖桿保持原位，視角持續轉動。關：拇指停住時搖桿回到中心，視角平順停止。");
         put("sec_layout", "Layout", "Disposition", "Anordnung", "Disposizione", "Disposición", "Layout",
                 "Расположение", "配置", "배치", "布局", "配置");
-        put("layout_n", "Move the buttons and sticks where you like them. The layout is saved.",
+        put("layout_n", "Move, resize, fade or hide every control. The layout is saved.",
                 "Placez les boutons et les sticks où vous voulez. La disposition est enregistrée.",
                 "Verschiebe Tasten und Sticks dorthin, wo du sie haben willst. Die Anordnung wird gespeichert.",
                 "Sposta pulsanti e stick dove preferisci. La disposizione viene salvata.",
@@ -544,7 +544,7 @@ final class Strings {
                 "Переместите кнопки и стики, куда вам удобно. Расположение сохраняется.",
                 "ボタンとスティックを好きな位置に動かせます。配置は保存されます。", "버튼과 스틱을 원하는 위치로 옮길 수 있습니다. 배치는 저장됩니다.",
                 "可将按键和摇杆移到你喜欢的位置。布局会被保存。", "可將按鍵和搖桿移到你喜歡的位置。配置會被儲存。");
-        put("edit_layout", "Edit layout", "Modifier la disposition", "Anordnung bearbeiten", "Modifica disposizione",
+        put("edit_layout", "Edit HUD", "Modifier la disposition", "Anordnung bearbeiten", "Modifica disposizione",
                 "Editar disposición", "Editar layout", "Изменить расположение", "配置を編集", "배치 편집", "编辑布局", "編輯配置");
         put("reset_layout", "Reset layout", "Réinitialiser la disposition", "Anordnung zurücksetzen",
                 "Ripristina disposizione", "Restablecer disposición", "Redefinir layout", "Сбросить расположение",
@@ -552,23 +552,23 @@ final class Strings {
         put("layout_reset_done", "Layout reset", "Disposition réinitialisée", "Anordnung zurückgesetzt",
                 "Disposizione ripristinata", "Disposición restablecida", "Layout redefinido", "Расположение сброшено",
                 "配置をリセットしました", "배치를 초기화했습니다", "布局已重置", "配置已重設");
-        put("edit_help", "Drag to move \u00b7 pinch or \u2212 / + to resize", "Glissez pour déplacer \u00b7 pincez ou \u2212 / + pour redimensionner",
+        put("edit_help", "Drag to move \u00b7 corner handle or pinch to resize", "Glissez pour déplacer \u00b7 pincez ou \u2212 / + pour redimensionner",
                 "Ziehen zum Verschieben \u00b7 Zwei Finger oder \u2212 / + für die Größe", "Trascina per spostare \u00b7 pizzica o \u2212 / + per ridimensionare",
                 "Arrastra para mover \u00b7 pellizca o \u2212 / + para cambiar el tamaño", "Arraste para mover \u00b7 pinça ou \u2212 / + para redimensionar",
                 "Перетаскивайте для перемещения \u00b7 щипок или \u2212 / + для размера", "ドラッグで移動 \u00b7 ピンチか \u2212 / + でサイズ変更",
                 "끌어서 이동 \u00b7 핀치 또는 \u2212 / + 로 크기 조절", "拖动以移动 \u00b7 双指缩放或 \u2212 / + 调整大小",
                 "拖曳以移動 \u00b7 雙指縮放或 \u2212 / + 調整大小");
-        put("size_pick", "Tap a control to resize it", "Touchez une commande pour la redimensionner",
+        put("size_pick", "Tap a control to edit it", "Touchez une commande pour la redimensionner",
                 "Tippe ein Steuerelement an, um seine Größe zu ändern", "Tocca un controllo per ridimensionarlo",
                 "Toca un control para cambiar su tamaño", "Toque um controle para redimensioná-lo",
                 "Коснитесь элемента, чтобы изменить размер", "サイズを変える操作ボタンをタップ", "크기를 바꿀 버튼을 누르세요",
                 "点击控件以调整大小", "點選控制項以調整大小");
         put("size_of", "Size: %d%%", "Taille : %d %%", "Größe: %d %%", "Dimensione: %d%%", "Tamaño: %d %%", "Tamanho: %d%%",
                 "Размер: %d%%", "サイズ：%d%%", "크기: %d%%", "大小：%d%%", "大小：%d%%");
-        put("sec_presets", "Layout presets", "Dispositions enregistrées", "Layout-Vorlagen", "Preset di layout",
+        put("sec_presets", "Layouts", "Dispositions enregistrées", "Layout-Vorlagen", "Preset di layout",
                 "Diseños guardados", "Predefinições de layout", "Пресеты раскладки", "レイアウトプリセット", "레이아웃 프리셋",
                 "布局预设", "版面預設");
-        put("presets_n", "Save the current layout under a name and switch between saved ones.",
+        put("presets_n", "Built-in layouts, and your own saved ones. Switching asks first if it would replace a layout you have not saved.",
                 "Enregistrez la disposition actuelle sous un nom et passez d'une disposition enregistrée à l'autre.",
                 "Speichere die aktuelle Anordnung unter einem Namen und wechsle zwischen gespeicherten.",
                 "Salva il layout attuale con un nome e passa da uno salvato all'altro.",
@@ -926,5 +926,49 @@ final class Strings {
                 "コントローラーまたはタッチ操作で − と + を同時に1秒間長押しすると、設定メニューが開きます。",
                 "컨트롤러나 터치 조작에서 − 와 + 를 동시에 1초 동안 누르면 설정 메뉴가 열립니다.",
                 "在手柄或触控操作上同时按住 − 和 + 一秒，即可打开设置菜单。", "在手把或觸控操作上同時按住 − 和 + 一秒，即可開啟設定選單。");
+    }
+
+    // HUD editor, appearance and layouts (English; the other languages fall back to it).
+    static {
+        put("grp_face", "Face buttons");
+        put("grp_dpad", "D-pad");
+        put("grp_stick", "Move stick");
+        put("grp_cam", "Camera area");
+        put("grp_zl", "ZL");
+        put("grp_l", "L");
+        put("grp_zr", "ZR");
+        put("grp_r", "R");
+        put("grp_minus", "Minus (\u2212)");
+        put("grp_plus", "Plus (+)");
+        put("grp_l3", "L3 (stick click)");
+        put("grp_lock", "Lock-on (R3)");
+        put("ed_reset_all", "Reset all");
+        put("ed_again", "Tap again");
+        put("ed_discard", "Discard?");
+        put("ed_opacity", "Opacity: %d%%");
+        put("ed_hide", "Hide");
+        put("ed_show", "Show");
+        put("ed_needed", "Opens the menu");
+        put("ed_reset_one", "Reset this one");
+        put("sec_appearance", "Appearance");
+        put("touch_size_t", "Button size");
+        put("touch_stick_size_t", "Joystick size");
+        put("touch_spacing_t", "Button spacing");
+        put("touch_dz_t", "Joystick dead zone");
+        put("float_t", "Floating joystick");
+        put("float_n", "The stick appears wherever you touch the left side of the screen.");
+        put("outline_t", "Button outlines");
+        put("labels_t", "Button labels");
+        put("preset_mobile", "Default Mobile");
+        put("preset_twothumb", "Two-Thumb");
+        put("preset_compact", "Compact");
+        put("preset_large", "Large Controls");
+        put("preset_switch", "Classic Switch");
+        put("replace_t", "Replace your layout?");
+        put("replace_m", "Your current layout is not saved as a preset. Replacing it cannot be undone.");
+        put("replace_copy", "Keep a copy");
+        put("replace_yes", "Replace");
+        put("preset_prev", "Previous layout %d");
+        put("restore_default", "Restore default layout");
     }
 }

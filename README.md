@@ -41,7 +41,7 @@ I have yet to test later areas in the game so don't expect performance to be ent
 - [x] Fully working audio, including NPC voice lines and sound effects
 - [x] Stable 60FPS (on my test device at least)
 - [x] Mailbox frame presentation for lower input latency
-- [x] On-screen touch controls
+- [x] On-screen touch controls: a mobile-style HUD with a full on-device editor (see below)
 - [x] Experimental different aspect ratio support without stretching game image
 - [x] User-selected game directory
 - [x] Floating GUI (Hold - and + buttons for one full second) with various settings such as FPS cap, aspect ratio, frame presentation, etc..
@@ -57,6 +57,33 @@ I have yet to test later areas in the game so don't expect performance to be ent
 
 
 
+
+## Touch controls
+
+The on-screen controls are a mobile HUD for the Switch controller the game expects (what each button presses never
+changes). Open the menu (hold - and + for a second), go to **Touch**:
+
+- **Edit HUD**: drag any control to move it, drag its corner handle (or pinch) to resize it, and use the panel to change
+  its size and opacity in steps, hide or show it, or put it back. Nothing you do there reaches the game. **Save** keeps
+  it, **Cancel** (tap twice if you changed something) drops it, **Reset all** (tap twice) restores the defaults. The
+  panel can be dragged by its title bar if it is in the way. - and + cannot be hidden: together they open this menu.
+- **Appearance**: button size, joystick size, button spacing, outlines and labels. **Controls**: opacity, camera
+  speed, joystick dead zone, floating joystick (the stick appears under your thumb on the left side).
+- **Layouts**: *Default Mobile*, *Two-Thumb*, *Compact*, *Large Controls* and *Classic Switch* (the original look), plus
+  your own saved presets. Switching never throws away a layout you have not saved: it asks, and can keep a copy.
+- The right half of the screen (except the buttons) steers the camera; its area can be moved and resized too (**Camera
+  area** in the editor).
+- The controls hide when a controller is connected or used and come back when the last one goes away, or with a double
+  tap on the screen.
+
+Everything is saved in `settings.txt` (`touch_layout`, `touch_size`, `touch_stick_size`, `touch_spacing`,
+`touch_deadzone`, `touch_stick_float`, `touch_outline`, `touch_labels`, ...). Layouts are stored in layout units (a
+tenth of the screen's short side) and the defaults are measured from the edge of the safe area, so they carry over to
+other screens and keep clear of camera cutouts. Layouts saved by earlier builds still load and look as they did.
+
+The HUD logic lives in `HudModel.java` (layout, geometry, presets), `HudTouch.java` (what every finger is doing) and
+`TouchControls.java` (drawing, editor, overlay window). The first two use no Android classes and are tested on the host:
+`tests/hud/run.sh` (needs a JDK only).
 
 ## Logs
 
